@@ -187,20 +187,46 @@ static void status_task(void *arg)
 static void led_task(void *arg)
 {
     int last = -1;
+    int64_t last_log = 0;
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(20));
         int64_t now = esp_timer_get_time();
+
         int m = 0;
         for (int i = 0; i < 3; i++) {
             if (now < s_led_until[i]) {
                 m |= 1 << i;
             }
         }
-        if (m != last) {
-            ws2812_set((m & (1 << LED_LEFT)) ? 255 : 0,
-                       (m & (1 << LED_RIGHT)) ? 255 : 0,
-                       (m & (1 << LED_BTN)) ? 255 : 0);
-            last = m;
+
+        uint8_t r = 0, g = 0, b = 0;
+        int show = m;
+
+        if (m != 0) {
+            /* 有动作：按你定的颜色（左红 / 右绿 / 键蓝 / 叠加=白） */
+            r = (m & (1 << LED_LEFT)) ? 255 : 0;
+            g = (m & (1 << LED_RIGHT)) ? 255 : 0;
+            b = (m & (1 << LED_BTN)) ? 255 : 0;
+        } else {
+            /* 没动作但还在收包：常亮一点很淡的绿，一眼能看出"活着"。
+               收不到包就全灭。 */
+            bool receiving = s_rx.last_rx_us != 0 &&
+                             (now - s_rx.last_rx_us) < 1000 * 1000LL;
+            if (receiving) {
+                g = 170;    /* 再乘 BRIGHT_PCT(25%) ≈ 42/255，暗暗的但看得见 */
+                show = 8;
+            } else {
+                show = 0;
+            }
+        }
+
+        if (show != last) {
+            ws2812_set(r, g, b);
+            last = show;
+            if (now - last_log > 500000) {
+                last_log = now;
+                ESP_LOGI(TAG, "灯=%d (RGB %d,%d,%d)", show, r, g, b);
+            }
         }
     }
 }
@@ -308,7 +334,13 @@ void app_main(void)
     ESP_LOGI(TAG, "NOW 接收板启动（%s）", esp_app_get_description()->version);
 
     if (ws2812_init(WS2812_GPIO_DEFAULT) == ESP_OK) {
-        ws2812_set(0, 0, 0);
+        /* 开机自检：白灯快闪 3 下，一眼确认这颗灯是活的 */
+        for (int i = 0; i < 3; i++) {
+            ws2812_set(255, 255, 255);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ws2812_set(0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
         ESP_LOGI(TAG, "RGB 灯就绪（GPIO%d），左摇杆=红 右摇杆=绿 按键=蓝", WS2812_GPIO_DEFAULT);
     } else {
         ESP_LOGW(TAG, "RGB 灯初始化失败，只是没有灯，不影响收包");
@@ -316,7 +348,8 @@ void app_main(void)
 
     wifi_now_init();
 
-    err = oled_init(OLED_SDA_GPIO, OLED_SCL_GPIO);
+    /* 接收板是无头盒子，只快速试一次，不跑 25 组引脚扫描（那要 3 秒） */
+    err = oled_init_quick(OLED_SDA_GPIO, OLED_SCL_GPIO);
     if (err == ESP_OK) {
         s_oled_ok = true;
         ui_message("ESP-NOW RX", "WAITING...");
