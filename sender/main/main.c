@@ -88,7 +88,14 @@ static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
         return;
     }
 
+    /* 换对端的条件：要么还没对端，要么老对端已经断了 2 秒。
+       否则"接收板"和"车"同时在空中回状态时，这里会来回切 MAC，链路就乱了。 */
     if (!s_peer_ok || memcmp(s_peer_mac, info->src_addr, ESP_NOW_ETH_ALEN) != 0) {
+        int64_t age = esp_timer_get_time() - s_peer_last_us;
+        bool old_alive = s_peer_last_us != 0 && age < 2000000LL;
+        if (s_peer_ok && old_alive) {
+            return;     /* 老对端还在，别的设备的状态包直接忽略 */
+        }
         memcpy(s_peer_mac, info->src_addr, ESP_NOW_ETH_ALEN);
         s_peer_new = true;
     }
