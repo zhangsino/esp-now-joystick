@@ -34,6 +34,7 @@
 #include "usb/hid_host.h"
 
 #include "now_proto.h"
+#include "ws2812_off.h"
 
 static const char *TAG = "now_tx";
 
@@ -44,7 +45,7 @@ static const char *TAG = "now_tx";
 /* ------------------------------ RC2 状态 ------------------------------ */
 
 typedef struct {
-    int16_t  x, y, z, rz;
+    int16_t  x, y, z, rz, dial;
     uint32_t buttons;
     bool     connected;
     uint32_t hz;
@@ -135,6 +136,7 @@ static void hid_interface_cb(hid_host_device_handle_t hid_dev,
         int16_t y  = (int16_t)(p[5] | (p[6] << 8));
         int16_t z  = (int16_t)(p[7] | (p[8] << 8));
         int16_t rz = (int16_t)(p[9] | (p[10] << 8));
+        int16_t dl = (int16_t)(p[11] | (p[12] << 8));   /* 第 5 轴 = 右侧拨盘 */
         uint32_t b = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
 
         portENTER_CRITICAL(&s_lock);
@@ -142,6 +144,7 @@ static void hid_interface_cb(hid_host_device_handle_t hid_dev,
         s_state.y = y;
         s_state.z = z;
         s_state.rz = rz;
+        s_state.dial = dl;
         s_state.buttons = b;
         portEXIT_CRITICAL(&s_lock);
 
@@ -295,6 +298,7 @@ static void sim_sample(now_joystick_t *p)
     p->rz = (int16_t)((t < 4000 ? -4000 : 4000) - tri / 2);
     p->y  = (int16_t)(tri / 6);
     p->z  = (int16_t)(tri / 4);
+    p->dial = (int16_t)(tri / 10);
     p->buttons = 1u << ((esp_timer_get_time() / 500000) % 24);
     p->flags = NOW_FLAG_RC2_ON;
 }
@@ -317,6 +321,7 @@ static void send_task(void *arg)
         p.y = st.y;
         p.z = st.z;
         p.rz = st.rz;
+        p.dial = st.dial;
         p.buttons = st.buttons;
         p.flags = st.connected ? NOW_FLAG_RC2_ON : 0;
         if (!st.connected && s_sim) {
@@ -372,9 +377,9 @@ static void rate_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         uint32_t fail = s_tx_fail;
-        ESP_LOGI(TAG, "rc2=%d hz=%lu X=%d Y=%d Z=%d Rz=%d btn=0x%06lx 发送失败+%lu%s",
+        ESP_LOGI(TAG, "rc2=%d hz=%lu X=%d Y=%d Z=%d Rz=%d Dial=%d btn=0x%06lx 发送失败+%lu%s",
                  st.connected ? 1 : 0, (unsigned long)c,
-                 st.x, st.y, st.z, st.rz, (unsigned long)st.buttons,
+                 st.x, st.y, st.z, st.rz, st.dial, (unsigned long)st.buttons,
                  (unsigned long)(fail - last_fail), s_sim ? "  [SIM]" : "");
         last_fail = fail;
     }
@@ -392,6 +397,10 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
 
     ESP_LOGI(TAG, "NOW 发送板启动（%s）", esp_app_get_description()->version);
+
+    if (ws2812_off(48) == ESP_OK) {
+        ESP_LOGI(TAG, "RGB 灯已关（GPIO48）");
+    }
 
     wifi_now_init();
 

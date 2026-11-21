@@ -29,6 +29,7 @@
 
 #include "ssd1306.h"
 #include "now_proto.h"
+#include "ws2812_off.h"
 
 static const char *TAG = "now_rx";
 
@@ -36,6 +37,8 @@ static const char *TAG = "now_rx";
 #define NOW_CHANNEL 11
 
 #define LINK_TIMEOUT_MS 1000   /* 超过这么久没包就算断链 */
+
+#define WS2812_GPIO 48         /* 板载 RGB 灯（WS2812） */
 
 /* ------------------------------ 收包状态 ------------------------------ */
 
@@ -134,9 +137,11 @@ static void draw_screen(void)
         oled_text_center(36, "RC2 NOT FOUND");
     } else if (linked) {
         uint32_t lost = st.lost > 9999 ? 9999 : st.lost;
-        snprintf(line, sizeof(line), "%2luHZ %3dDB L%-4lu",
-                 (unsigned long)st.hz, st.rssi, (unsigned long)lost);
+        snprintf(line, sizeof(line), "%2luHZ %3dDB %+5d",
+                 (unsigned long)st.hz, st.rssi, st.pkt.dial);
         oled_text(0, 0, line);
+        snprintf(line, sizeof(line), "L%lu", (unsigned long)lost);
+        oled_text(96, 0, line);
         draw_stick(STICK_LX, STICK_CY, st.pkt.rz, st.pkt.z);
         draw_stick(STICK_RX, STICK_CY, st.pkt.x, st.pkt.y);
         draw_buttons(st.pkt.buttons);
@@ -165,11 +170,11 @@ static void rate_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         ESP_LOGI(TAG, "rx=%luHz rssi=%d lost=%lu seq=%lu btn=0x%06lx rc2=%d "
-                      "X=%d Y=%d Z=%d Rz=%d",
+                      "X=%d Y=%d Z=%d Rz=%d Dial=%d",
                  (unsigned long)st.hz, st.rssi, (unsigned long)st.lost,
                  (unsigned long)st.rx_seq, (unsigned long)st.pkt.buttons,
                  (st.pkt.flags & NOW_FLAG_RC2_ON) ? 1 : 0,
-                 st.pkt.x, st.pkt.y, st.pkt.z, st.pkt.rz);
+                 st.pkt.x, st.pkt.y, st.pkt.z, st.pkt.rz, st.pkt.dial);
     }
 }
 
@@ -216,6 +221,11 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
 
     ESP_LOGI(TAG, "NOW 接收板启动（%s）", esp_app_get_description()->version);
+
+    /* 板载 RGB 灯先灭掉：WS2812 断电才会自己灭，这里主动发一帧全 0 */
+    if (ws2812_off(WS2812_GPIO) == ESP_OK) {
+        ESP_LOGI(TAG, "RGB 灯已关（GPIO%d）", WS2812_GPIO);
+    }
 
     wifi_now_init();
 

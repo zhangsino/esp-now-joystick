@@ -17,7 +17,7 @@
 
 #define NOW_MAGIC0 0x4A          /* 'J' */
 #define NOW_MAGIC1 0x53          /* 'S' */
-#define NOW_VER    1
+#define NOW_VER    2
 
 /* flags 位定义 */
 #define NOW_FLAG_RC2_ON    (1u << 0)   /* RC2 已枚举、正在出报告 */
@@ -35,13 +35,14 @@ typedef struct __attribute__((packed)) {
     int16_t  y;             /* 右摇杆 上下   -660..+660（上为 +） */
     int16_t  z;             /* 左摇杆 上下   -660..+660（上为 +，无回中弹簧） */
     int16_t  rz;            /* 左摇杆 左右   -660..+660（右为 +） */
+    int16_t  dial;          /* 右侧拨盘（第 5 轴，byte 11-12），回中 */
     uint32_t buttons;       /* 24 位按键，bit0..bit23 */
     uint8_t  rc2_hz;        /* RC2 原始报告率（约 247），仅显示用 */
     uint8_t  xor8;          /* 从 magic[0] 到 rc2_hz 的异或 */
 } now_joystick_t;
 
 /* 字节数在编译期就得定住，别到板上才发现结构体被填充 */
-typedef char now_joystick_size_check[(sizeof(now_joystick_t) == 22) ? 1 : -1];
+typedef char now_joystick_size_check[(sizeof(now_joystick_t) == 24) ? 1 : -1];
 
 static inline uint8_t now_xor8(const now_joystick_t *p)
 {
