@@ -481,12 +481,18 @@ static void rate_task(void *arg)
         uint32_t tot = ok + fail;
         s_tx_pct = tot ? (ok * 100 / tot) : 0;
 
+        /* 没有对端时是广播，esp_now 的发送回调永远报成功，那个百分比是假的，别显示 */
+        char txbuf[16];
+        if (s_peer_ok) {
+            snprintf(txbuf, sizeof(txbuf), "%lu%%", (unsigned long)s_tx_pct);
+        } else {
+            snprintf(txbuf, sizeof(txbuf), "广播");
+        }
         ESP_LOGI(TAG, "rc2=%d hz=%lu X=%d Y=%d Z=%d Rz=%d Dial=%d btn=0x%06lx "
-                      "tx=%lu/%lu(%lu%%) peer=%d rssi=%d lost=%lu%s",
+                      "tx=%s peer=%d rssi=%d lost=%lu%s",
                  st.connected ? 1 : 0, (unsigned long)c,
                  st.x, st.y, st.z, st.rz, st.dial, (unsigned long)st.buttons,
-                 (unsigned long)ok, (unsigned long)tot, (unsigned long)s_tx_pct,
-                 s_peer_ok ? 1 : 0, s_peer_rssi, (unsigned long)s_peer_lost,
+                 txbuf, s_peer_ok ? 1 : 0, s_peer_rssi, (unsigned long)s_peer_lost,
                  s_sim ? "  [SIM]" : "");
     }
 }

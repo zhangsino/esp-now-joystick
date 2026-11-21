@@ -94,6 +94,14 @@ static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
             s_led_until[LED_BTN] = now + LED_HOLD_MS * 1000LL;
         }
     }
+    /* 序号倒退 = 发送板重启过了，计数从头来（否则 L 会一直累积到 999 下不来） */
+    if (s_rx.rx_total > 0 && p.seq < s_rx.rx_seq) {
+        ESP_LOGI(TAG, "发送板重启（seq %lu -> %lu），丢包计数清零",
+                 (unsigned long)s_rx.rx_seq, (unsigned long)p.seq);
+        s_rx.lost = 0;
+        s_rx.rx_total = 0;
+        s_rx.rx_seq = 0;
+    }
     if (s_rx.rx_seq != 0 && p.seq > s_rx.rx_seq + 1) {
         s_rx.lost += p.seq - s_rx.rx_seq - 1;
     }
