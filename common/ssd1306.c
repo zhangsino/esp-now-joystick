@@ -6,6 +6,8 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/i2c_master.h"
 #include "ssd1306.h"
@@ -55,7 +57,15 @@ static esp_err_t try_pins(int sda_gpio, int scl_gpio)
         return err;
     }
 
-    err = i2c_master_probe(s_bus, OLED_ADDR, 200);
+    /* 屏上电后要几十毫秒才应答，探一次就放弃会误判"屏不在"。
+       实测：第一次 200ms 超时失败，紧接着再探就通了。 */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        err = i2c_master_probe(s_bus, OLED_ADDR, 100);
+        if (err == ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
     if (err != ESP_OK) {
         /* 顺便看看总线上到底挂了什么，方便判断是没接、还是地址不对 */
         const uint8_t probe[] = { 0x3C, 0x3D, 0x68, 0x76 };
@@ -119,6 +129,12 @@ static const struct { uint8_t sda, scl; } s_cand[] = {
     { 39, 40 }, { 40, 41 },
     { 41, 42 }, { 1, 2 }, { 2, 4 },
 };
+
+/* 只试指定的一对脚，不扫候选（给"开机没找到、运行时再补一次"用） */
+esp_err_t oled_init_quick(int sda_gpio, int scl_gpio)
+{
+    return try_pins(sda_gpio, scl_gpio);
+}
 
 esp_err_t oled_init(int sda_gpio, int scl_gpio)
 {

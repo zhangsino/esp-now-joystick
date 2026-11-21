@@ -18,6 +18,7 @@
 #define OLED_ADDR     0x3C
 
 esp_err_t oled_init(int sda_gpio, int scl_gpio);
+esp_err_t oled_init_quick(int sda_gpio, int scl_gpio);
 void oled_clear(void);
 void oled_pixel(int x, int y);
 void oled_hline(int x, int y, int w);

@@ -400,9 +400,20 @@ static void display_task(void *arg)
     bool was_on = false;
     int64_t splash_until = 0;
 
+    int64_t retry_at = 0;
+
     while (true) {
         if (!s_oled_ok) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            /* 开机时没找到屏（比如屏上电慢、线刚接上），隔 3 秒再补试一次 */
+            if (esp_timer_get_time() > retry_at) {
+                retry_at = esp_timer_get_time() + 3000000;
+                if (oled_init_quick(OLED_SDA_GPIO, OLED_SCL_GPIO) == ESP_OK) {
+                    s_oled_ok = true;
+                    ESP_LOGI(TAG, "屏补上了（重试成功）");
+                    ui_message("ESP-NOW TX", "WAITING...");
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
