@@ -15,8 +15,10 @@
 #include <stddef.h>
 #include <string.h>
 
-#define NOW_MAGIC0 0x4A          /* 'J' */
+#define NOW_MAGIC0 0x4A          /* 'J' 摇杆包 */
 #define NOW_MAGIC1 0x53          /* 'S' */
+#define NOW_ST0    0x52          /* 'R' 接收板回传的状态包 */
+#define NOW_ST1    0x53          /* 'S' */
 #define NOW_VER    2
 
 /* flags 位定义 */
@@ -60,6 +62,51 @@ static inline void now_pack(now_joystick_t *p)
     p->magic[1] = NOW_MAGIC1;
     p->ver = NOW_VER;
     p->xor8 = now_xor8(p);
+}
+
+/* ---------------- 接收板 -> 发送板：状态包 ---------------- *
+ * 接收板每 200 ms 播一次，发送板据此知道"我的包被收到了"以及对方看到的信号。
+ * 用 MAC 层单播发回去（esp_now_send 给单播地址时，回调里的状态就是对方到底收没收到）。
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t  magic[2];      /* 'R','S' */
+    uint8_t  ver;
+    uint8_t  flags;
+    uint32_t rx_seq;        /* 最后收到的摇杆包序号 */
+    uint32_t rx_total;      /* 累计收到多少包 */
+    uint32_t lost;          /* 估算丢包 */
+    int8_t   rssi;          /* 收摇杆包时的信号强度 */
+    uint8_t  rx_hz;         /* 每秒收包数 */
+    uint8_t  xor8;
+} now_status_t;
+
+typedef char now_status_size_check[(sizeof(now_status_t) == 19) ? 1 : -1];
+
+static inline uint8_t now_xor8_buf(const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    uint8_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        v ^= b[i];
+    }
+    return v;
+}
+
+static inline void now_status_pack(now_status_t *p)
+{
+    p->magic[0] = NOW_ST0;
+    p->magic[1] = NOW_ST1;
+    p->ver = NOW_VER;
+    p->xor8 = now_xor8_buf(p, offsetof(now_status_t, xor8));
+}
+
+/* 返回 0 = 合法 */
+static inline int now_status_unpack(const now_status_t *p)
+{
+    if (p->magic[0] != NOW_ST0 || p->magic[1] != NOW_ST1) return -1;
+    if (p->ver != NOW_VER) return -2;
+    if (p->xor8 != now_xor8_buf(p, offsetof(now_status_t, xor8))) return -3;
+    return 0;
 }
 
 /* 返回 0 = 合法 */

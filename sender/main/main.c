@@ -1,16 +1,14 @@
 /*
- * 摇杆发送板 —— DJI RC2 (USB HID) → ESP-NOW 广播
+ * 摇杆发送板（手持端）—— DJI RC2 (USB Host) → 小屏 + ESP-NOW 广播
  *
- * USB 这半边是从 ~/esp/rc2_web 搬过来的、已在板上跑通（247 Hz，13 字节报告），
- * 只砍掉网页/WebSocket，换成每 20 ms 广播一包 now_joystick_t。
+ * 这版把屏挪到发送板上：一插上 RC2，屏上立刻打 "RC2 CONNECTED"，
+ * 之后显示实时画面（摇杆盘 + 24 个按键位 + 链路质量）。
  *
- * 关键坑（已在 rc2_web 里解决，别改回去）：
- *   RC2 的 HID 中断 IN 端点把 wMaxPacketSize 写成 512（全速上限 64），
- *   ESP32-S3 的 DWC FIFO 上限 408，占用接口会报 ESP_ERR_NOT_SUPPORTED。
- *   必须在 hid_host_device_open 之前把描述符里的这个值钳到 64。
+ * 链路是**双向**的：接收板每 200 ms 回一个状态包（它自己的收包率/信号/丢包），
+ * 发送板收到就说明"我发的包被收到了"，同时把对端的 MAC 学下来，改成单播发。
  *
- * 引脚：RC2 插板子的 USB（OTG）口，也就是 GPIO19/20 那个口；
- *      日志走 UART0（CH343 那个口，115200）——两个口别插反。
+ * USB 这半边沿用 ~/esp/rc2_web 里已验证的代码（247 Hz，13 字节报告），只换了出口。
+ * 引脚：RC2 插 USB(OTG) 口（GPIO19/20）；日志走 UART0（CH343）；OLED 走 I2C 17/18。
  */
 #include <stdio.h>
 #include <string.h>
@@ -34,13 +32,17 @@
 #include "usb/hid_host.h"
 
 #include "now_proto.h"
-#include "ws2812_off.h"
+#include "ssd1306.h"
+#include "ui.h"
+#include "ws2812.h"
 
 static const char *TAG = "now_tx";
 
-#define NOW_CHANNEL 11
-#define REPORT_LEN  13
-#define SEND_PERIOD_MS 20      /* 50 Hz：够顺，又不会把 2.4G 占满 */
+#define NOW_CHANNEL     11
+#define REPORT_LEN      13
+#define SEND_PERIOD_MS  20      /* 50 Hz */
+#define PEER_TIMEOUT_MS 1500    /* 这么久没收到状态包就算对面没了 */
+#define SPLASH_MS       2000    /* "RC2 CONNECTED" 停留时间 */
 
 /* ------------------------------ RC2 状态 ------------------------------ */
 
@@ -54,11 +56,59 @@ typedef struct {
 static rc2_state_t s_state;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_rate_cnt;
-
-/* 没有 RC2 时按 k 发一路模拟扫动，用来单独验接收板和屏 */
 static volatile bool s_sim;
 
-/* ------------------------ 修 RC2 的坏描述符 ------------------------ */
+/* ------------------------------ 链路状态 ------------------------------ */
+
+static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN];
+static volatile bool s_peer_ok;
+static volatile bool s_peer_new;
+static volatile int8_t  s_peer_rssi;
+static volatile uint32_t s_peer_lost;
+static volatile int64_t s_peer_last_us;
+static volatile uint32_t s_tx_ok, s_tx_fail;
+static volatile uint32_t s_tx_pct;
+
+static const uint8_t s_bcast[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+static bool peer_alive(void)
+{
+    int64_t t = s_peer_last_us;
+    return t != 0 && (esp_timer_get_time() - t) < PEER_TIMEOUT_MS * 1000LL;
+}
+
+static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    if (!info || !info->src_addr || len < (int)sizeof(now_status_t)) {
+        return;
+    }
+    now_status_t p;
+    memcpy(&p, data, sizeof(p));
+    if (now_status_unpack(&p) != 0) {
+        return;
+    }
+
+    if (!s_peer_ok || memcmp(s_peer_mac, info->src_addr, ESP_NOW_ETH_ALEN) != 0) {
+        memcpy(s_peer_mac, info->src_addr, ESP_NOW_ETH_ALEN);
+        s_peer_new = true;
+    }
+    s_peer_rssi = p.rssi;
+    s_peer_lost = p.lost;
+    s_peer_last_us = esp_timer_get_time();
+}
+
+static void now_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        s_tx_ok++;
+    } else {
+        s_tx_fail++;
+    }
+}
+
+/* ------------------------------ USB HID ------------------------------ */
+
 static usb_host_client_handle_t s_client;
 
 static int clamp_intr_ep_mps(usb_config_desc_t *cfg)
@@ -136,7 +186,7 @@ static void hid_interface_cb(hid_host_device_handle_t hid_dev,
         int16_t y  = (int16_t)(p[5] | (p[6] << 8));
         int16_t z  = (int16_t)(p[7] | (p[8] << 8));
         int16_t rz = (int16_t)(p[9] | (p[10] << 8));
-        int16_t dl = (int16_t)(p[11] | (p[12] << 8));   /* 第 5 轴 = 右侧拨盘 */
+        int16_t dl = (int16_t)(p[11] | (p[12] << 8));
         uint32_t b = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
 
         portENTER_CRITICAL(&s_lock);
@@ -243,15 +293,15 @@ static void usb_task(void *arg)
 
 /* ------------------------------ ESP-NOW ------------------------------ */
 
-static const uint8_t s_bcast[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-static volatile uint32_t s_tx_fail;
-
-static void now_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+static bool add_peer(const uint8_t *mac)
 {
-    (void)tx_info;
-    if (status != ESP_NOW_SEND_SUCCESS) {
-        s_tx_fail++;
-    }
+    esp_now_peer_info_t pi = {0};
+    memcpy(pi.peer_addr, mac, ESP_NOW_ETH_ALEN);
+    pi.channel = NOW_CHANNEL;
+    pi.ifidx = ESP_IF_WIFI_STA;
+    pi.encrypt = false;
+    esp_err_t e = esp_now_add_peer(&pi);
+    return e == ESP_OK || e == ESP_ERR_ESPNOW_EXIST;
 }
 
 static void wifi_now_init(void)
@@ -274,26 +324,17 @@ static void wifi_now_init(void)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], NOW_CHANNEL);
 
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(now_recv_cb));
     ESP_ERROR_CHECK(esp_now_register_send_cb(now_send_cb));
-
-    esp_now_peer_info_t peer = {0};
-    memcpy(peer.peer_addr, s_bcast, ESP_NOW_ETH_ALEN);
-    peer.channel = NOW_CHANNEL;
-    peer.ifidx = ESP_IF_WIFI_STA;
-    peer.encrypt = false;
-    esp_err_t err = esp_now_add_peer(&peer);
-    if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
-        ESP_LOGW(TAG, "add broadcast peer: %s（广播仍可发）", esp_err_to_name(err));
-    }
+    add_peer(s_bcast);   /* 还没学到接收板之前先广播 */
 }
 
 /* ------------------------------ 发送 ------------------------------ */
 
 static void sim_sample(now_joystick_t *p)
 {
-    /* 8 秒一个三角波周期，四根轴错开相位；按键每 0.5 秒换个位 */
     int32_t t = (int32_t)(esp_timer_get_time() / 1000 % 8000);
-    int32_t tri = (t < 4000) ? (t * 2 - 4000) : (12000 - t * 2);   /* -4000..4000 */
+    int32_t tri = (t < 4000) ? (t * 2 - 4000) : (12000 - t * 2);
     p->x  = (int16_t)(tri / 8);
     p->rz = (int16_t)((t < 4000 ? -4000 : 4000) - tri / 2);
     p->y  = (int16_t)(tri / 6);
@@ -310,6 +351,20 @@ static void send_task(void *arg)
 
     while (true) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(SEND_PERIOD_MS));
+
+        /* 学到新的接收板就登记成单播对端：这样 esp_now_send 的回调才代表"对方收到了" */
+        if (s_peer_new) {
+            s_peer_new = false;
+            if (s_peer_ok) {
+                esp_now_del_peer(s_peer_mac);
+            }
+            s_peer_ok = add_peer(s_peer_mac);
+            if (s_peer_ok) {
+                ESP_LOGI(TAG, "接收板上线 %02x:%02x:%02x:%02x:%02x:%02x（改单播）",
+                         s_peer_mac[0], s_peer_mac[1], s_peer_mac[2],
+                         s_peer_mac[3], s_peer_mac[4], s_peer_mac[5]);
+            }
+        }
 
         now_joystick_t p = {0};
         rc2_state_t st;
@@ -331,13 +386,59 @@ static void send_task(void *arg)
         p.rc2_hz = (uint8_t)(st.hz > 255 ? 255 : st.hz);
         now_pack(&p);
 
-        esp_now_send(s_bcast, (const uint8_t *)&p, sizeof(p));
+        const uint8_t *dst = (s_peer_ok && peer_alive()) ? s_peer_mac : s_bcast;
+        esp_now_send(dst, (const uint8_t *)&p, sizeof(p));
     }
 }
 
-/* ------------------------------ 模拟模式（BOOT 键） ------------------------------ */
-/* 没插 RC2 时按一下 BOOT 键（GPIO0）发一路模拟扫动，用来单独验接收板和屏。
- * 不用串口输入：默认控制台没装 UART 驱动，uart_read_bytes 会一直报 driver error。 */
+/* ------------------------------ 屏幕 ------------------------------ */
+
+static bool s_oled_ok;
+
+static void display_task(void *arg)
+{
+    bool was_on = false;
+    int64_t splash_until = 0;
+
+    while (true) {
+        if (!s_oled_ok) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        rc2_state_t st;
+        portENTER_CRITICAL(&s_lock);
+        st = s_state;
+        portEXIT_CRITICAL(&s_lock);
+
+        if (st.connected && !was_on) {
+            splash_until = esp_timer_get_time() + SPLASH_MS * 1000LL;
+            ESP_LOGI(TAG, "屏：RC2 CONNECTED");
+        }
+        was_on = st.connected;
+
+        if (!st.connected) {
+            ui_message("PLUG IN RC2", "WAITING...");
+        } else if (esp_timer_get_time() < splash_until) {
+            ui_message("RC2 CONNECTED", "USB HOST OK");
+        } else {
+            ui_state_t u = {
+                .rc2_on = true,
+                .link_on = peer_alive(),
+                .x = st.x, .y = st.y, .z = st.z, .rz = st.rz, .dial = st.dial,
+                .buttons = st.buttons,
+                .rssi = s_peer_rssi,
+                .lost = s_peer_lost,
+                .pct  = s_tx_pct,
+            };
+            ui_live(&u);
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+/* ------------------------------ 模拟模式 ------------------------------ */
+
 static void btn_task(void *arg)
 {
     const gpio_config_t io = {
@@ -365,7 +466,6 @@ static void btn_task(void *arg)
 
 static void rate_task(void *arg)
 {
-    uint32_t last_fail = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t c = s_rate_cnt;
@@ -376,12 +476,18 @@ static void rate_task(void *arg)
         rc2_state_t st = s_state;
         portEXIT_CRITICAL(&s_lock);
 
-        uint32_t fail = s_tx_fail;
-        ESP_LOGI(TAG, "rc2=%d hz=%lu X=%d Y=%d Z=%d Rz=%d Dial=%d btn=0x%06lx 发送失败+%lu%s",
+        uint32_t ok = s_tx_ok, fail = s_tx_fail;
+        s_tx_ok = s_tx_fail = 0;
+        uint32_t tot = ok + fail;
+        s_tx_pct = tot ? (ok * 100 / tot) : 0;
+
+        ESP_LOGI(TAG, "rc2=%d hz=%lu X=%d Y=%d Z=%d Rz=%d Dial=%d btn=0x%06lx "
+                      "tx=%lu/%lu(%lu%%) peer=%d rssi=%d lost=%lu%s",
                  st.connected ? 1 : 0, (unsigned long)c,
                  st.x, st.y, st.z, st.rz, st.dial, (unsigned long)st.buttons,
-                 (unsigned long)(fail - last_fail), s_sim ? "  [SIM]" : "");
-        last_fail = fail;
+                 (unsigned long)ok, (unsigned long)tot, (unsigned long)s_tx_pct,
+                 s_peer_ok ? 1 : 0, s_peer_rssi, (unsigned long)s_peer_lost,
+                 s_sim ? "  [SIM]" : "");
     }
 }
 
@@ -398,16 +504,27 @@ void app_main(void)
 
     ESP_LOGI(TAG, "NOW 发送板启动（%s）", esp_app_get_description()->version);
 
-    if (ws2812_off(48) == ESP_OK) {
-        ESP_LOGI(TAG, "RGB 灯已关（GPIO48）");
+    if (ws2812_init(WS2812_GPIO_DEFAULT) == ESP_OK) {
+        ws2812_set(0, 0, 0);
+        ESP_LOGI(TAG, "RGB 灯已关（GPIO%d）", WS2812_GPIO_DEFAULT);
     }
 
     wifi_now_init();
 
+    err = oled_init(OLED_SDA_GPIO, OLED_SCL_GPIO);
+    if (err == ESP_OK) {
+        s_oled_ok = true;
+        ui_message("ESP-NOW TX", "WAITING...");
+    } else {
+        ESP_LOGW(TAG, "OLED 不在（%s）：屏没接也能跑，日志里照样有数据",
+                 esp_err_to_name(err));
+    }
+
     xTaskCreate(usb_task, "usb_task", 4096, NULL, 4, NULL);
     xTaskCreate(send_task, "send", 4096, NULL, 5, NULL);
+    xTaskCreate(display_task, "disp", 4096, NULL, 3, NULL);
     xTaskCreate(rate_task, "rate", 3072, NULL, 2, NULL);
     xTaskCreate(btn_task, "btn", 3072, NULL, 2, NULL);
 
-    ESP_LOGI(TAG, "ready: 把 RC2 插到板子的 USB(OTG) 口；没插 RC2 就按板上 BOOT 键切模拟数据");
+    ESP_LOGI(TAG, "ready: RC2 插 USB(OTG) 口；OLED 接 SDA17/SCL18");
 }

@@ -1,18 +1,18 @@
 /*
- * 摇杆接收板 —— ESP-NOW → 128x64 OLED
+ * 摇杆接收板 —— ESP-NOW 收包 + 回传状态（屏可选）
  *
- * 收到发送端（RC2 板）的 now_joystick_t，画成：
- *   顶部  链路状态（收包率 / RSSI / 丢包数）
- *   中间  左右两个摇杆盘（左盘竖轴是油门，没有回中弹簧）
- *   底部  24 个按键位，亮 = 按下；上排 bit0-11，下排 bit12-23
+ * 这块板现在是"无头小盒子"：收发送板的摇杆包，每 200 ms 把
+ * 「我收到了多少包 / 信号多强 / 丢了多少」回传给发送板。
+ * 发送板据此知道自己有没有被接收到，屏也画在发送板那一侧。
  *
- * 引脚（既定分配，见 hobby/AGENTS.md）：
- *   OLED SDA=GPIO17  SCL=GPIO18  VCC=3V3  GND=GND   地址 0x3C
- *   日志走 UART0（CH343 那个口，115200）——只有这个口能同时烧录和看日志。
+ * OLED 仍然保留支持：插着就画同一套画面，没插就只做回传（oled_init 失败不影响运行）。
+ *
+ * 引脚：OLED SDA=17 SCL=18 VCC=3V3；日志走原生 USB 口（开了 USJ 副控制台）。
  */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,33 +27,46 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 
-#include "ssd1306.h"
 #include "now_proto.h"
-#include "ws2812_off.h"
+#include "ssd1306.h"
+#include "ui.h"
+#include "ws2812.h"
 
 static const char *TAG = "now_rx";
 
-/* 两端必须同一个信道。家里 2.4G 全挤在 ch6，所以用 11（和 r3car 一致）。 */
-#define NOW_CHANNEL 11
+#define NOW_CHANNEL     11
+#define LINK_TIMEOUT_MS 1000
+#define STATUS_PERIOD_MS 200
 
-#define LINK_TIMEOUT_MS 1000   /* 超过这么久没包就算断链 */
-
-#define WS2812_GPIO 48         /* 板载 RGB 灯（WS2812） */
+#define LED_HOLD_MS  250    /* 动作之后亮多久 */
+#define LED_MOVE_TH  40     /* 摇杆变化超过这个幅度才算动了（满行程 660） */
 
 /* ------------------------------ 收包状态 ------------------------------ */
 
 typedef struct {
     now_joystick_t pkt;
-    uint32_t rx_seq;        /* 本端收到的最新序号 */
-    uint32_t lost;          /* 累计丢包（按序号跳变估） */
-    int      rssi;
+    uint32_t rx_seq;
+    uint32_t lost;
+    uint32_t rx_total;
+    int8_t   rssi;
     int64_t  last_rx_us;
-    uint32_t rx_cnt;        /* 本秒收包数 */
-    uint32_t hz;            /* 上一秒的收包率 */
+    uint32_t rx_cnt;
+    uint32_t hz;
 } rx_state_t;
 
 static rx_state_t s_rx;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+
+#define LED_LEFT  0
+#define LED_RIGHT 1
+#define LED_BTN   2
+static volatile int64_t s_led_until[3];
+
+static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN];
+static volatile bool s_peer_ok;
+static volatile bool s_peer_new;
+static const uint8_t s_bcast[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+static volatile uint32_t s_tx_ok, s_tx_fail;
 
 static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
@@ -67,93 +80,159 @@ static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
     }
 
     portENTER_CRITICAL(&s_lock);
+    if (s_rx.rx_total > 0) {
+        /* 和上一帧比：哪个变了就让对应颜色亮一会儿 */
+        int64_t now = esp_timer_get_time();
+        const now_joystick_t *q = &s_rx.pkt;
+        if (abs((int)p.rz - q->rz) > LED_MOVE_TH || abs((int)p.z - q->z) > LED_MOVE_TH) {
+            s_led_until[LED_LEFT] = now + LED_HOLD_MS * 1000LL;
+        }
+        if (abs((int)p.x - q->x) > LED_MOVE_TH || abs((int)p.y - q->y) > LED_MOVE_TH) {
+            s_led_until[LED_RIGHT] = now + LED_HOLD_MS * 1000LL;
+        }
+        if (p.buttons != q->buttons) {
+            s_led_until[LED_BTN] = now + LED_HOLD_MS * 1000LL;
+        }
+    }
     if (s_rx.rx_seq != 0 && p.seq > s_rx.rx_seq + 1) {
         s_rx.lost += p.seq - s_rx.rx_seq - 1;
     }
     s_rx.rx_seq = p.seq;
     s_rx.pkt = p;
-    s_rx.rssi = info && info->rx_ctrl ? info->rx_ctrl->rssi : 0;
+    s_rx.rssi = info && info->rx_ctrl ? (int8_t)info->rx_ctrl->rssi : 0;
     s_rx.last_rx_us = esp_timer_get_time();
     s_rx.rx_cnt++;
+    s_rx.rx_total++;
     portEXIT_CRITICAL(&s_lock);
+
+    if (info && info->src_addr &&
+        (!s_peer_ok || memcmp(s_peer_mac, info->src_addr, ESP_NOW_ETH_ALEN) != 0)) {
+        memcpy(s_peer_mac, info->src_addr, ESP_NOW_ETH_ALEN);
+        s_peer_new = true;
+    }
 }
 
-/* ------------------------------ 画界面 ------------------------------ */
-
-#define STICK_R     15
-#define STICK_LX    32
-#define STICK_RX    96
-#define STICK_CY    25
-#define BTN_ROW1_Y  47
-#define BTN_ROW2_Y  58
-
-static void draw_stick(int cx, int cy, int ax, int ay)
+static void now_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
-    oled_circle(cx, cy, STICK_R);
-    /* 中位十字，方便看"回中没有" */
-    oled_hline(cx - 3, cy, 7);
-    oled_vline(cx, cy - 3, 7);
-
-    int dx = (int)((int32_t)ax * (STICK_R - 2) / NOW_AXIS_FULL);
-    int dy = (int)((int32_t)ay * (STICK_R - 2) / NOW_AXIS_FULL);
-    if (dx > STICK_R - 2) dx = STICK_R - 2;
-    if (dx < -(STICK_R - 2)) dx = -(STICK_R - 2);
-    if (dy > STICK_R - 2) dy = STICK_R - 2;
-    if (dy < -(STICK_R - 2)) dy = -(STICK_R - 2);
-    oled_disc(cx + dx, cy - dy, 2);   /* y 取负：原始"推上=正"，屏幕向下为正 */
+    (void)tx_info;
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        s_tx_ok++;
+    } else {
+        s_tx_fail++;
+    }
 }
 
-static void draw_buttons(uint32_t buttons)
+static bool add_peer(const uint8_t *mac)
 {
-    for (int i = 0; i < 24; i++) {
-        int col = i % 12;
-        int row = i / 12;
-        int cx = 8 + col * 10;
-        int cy = row == 0 ? BTN_ROW1_Y : BTN_ROW2_Y;
-        if (buttons & (1u << i)) {
-            oled_disc(cx, cy, 3);
-        } else {
-            oled_pixel(cx, cy);
+    esp_now_peer_info_t pi = {0};
+    memcpy(pi.peer_addr, mac, ESP_NOW_ETH_ALEN);
+    pi.channel = NOW_CHANNEL;
+    pi.ifidx = ESP_IF_WIFI_STA;
+    pi.encrypt = false;
+    esp_err_t e = esp_now_add_peer(&pi);
+    return e == ESP_OK || e == ESP_ERR_ESPNOW_EXIST;
+}
+
+/* ------------------------------ 回传状态 ------------------------------ */
+
+static void status_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+    uint32_t seq = 0;
+
+    while (true) {
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(STATUS_PERIOD_MS));
+
+        if (s_peer_new) {
+            s_peer_new = false;
+            if (s_peer_ok) {
+                esp_now_del_peer(s_peer_mac);
+            }
+            s_peer_ok = add_peer(s_peer_mac);
+            if (s_peer_ok) {
+                ESP_LOGI(TAG, "发送板上线 %02x:%02x:%02x:%02x:%02x:%02x（改单播回传）",
+                         s_peer_mac[0], s_peer_mac[1], s_peer_mac[2],
+                         s_peer_mac[3], s_peer_mac[4], s_peer_mac[5]);
+            }
+        }
+
+        now_status_t st = {0};
+        portENTER_CRITICAL(&s_lock);
+        st.rx_seq = s_rx.rx_seq;
+        st.rx_total = s_rx.rx_total;
+        st.lost = s_rx.lost;
+        st.rssi = s_rx.rssi;
+        st.rx_hz = (uint8_t)(s_rx.hz > 255 ? 255 : s_rx.hz);
+        portEXIT_CRITICAL(&s_lock);
+        st.flags = 0;
+        now_status_pack(&st);
+
+        const uint8_t *dst = s_peer_ok ? s_peer_mac : s_bcast;
+        esp_now_send(dst, (const uint8_t *)&st, sizeof(st));
+        seq++;
+    }
+}
+
+/* ------------------------------ RGB 灯 ------------------------------ */
+/* 左摇杆动=红，右摇杆动=绿，按键动=蓝；同时动就是叠加出来的颜色（三个都动=白）。
+   静止 250 ms 之后全灭。 */
+static void led_task(void *arg)
+{
+    int last = -1;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+        int64_t now = esp_timer_get_time();
+        int m = 0;
+        for (int i = 0; i < 3; i++) {
+            if (now < s_led_until[i]) {
+                m |= 1 << i;
+            }
+        }
+        if (m != last) {
+            ws2812_set((m & (1 << LED_LEFT)) ? 255 : 0,
+                       (m & (1 << LED_RIGHT)) ? 255 : 0,
+                       (m & (1 << LED_BTN)) ? 255 : 0);
+            last = m;
         }
     }
 }
 
-static void draw_screen(void)
+/* ------------------------------ 屏幕（可选） ------------------------------ */
+
+static bool s_oled_ok;
+
+static void display_task(void *arg)
 {
-    rx_state_t st;
-    portENTER_CRITICAL(&s_lock);
-    st = s_rx;
-    portEXIT_CRITICAL(&s_lock);
+    while (true) {
+        if (!s_oled_ok) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
 
-    bool linked = st.last_rx_us != 0 &&
-                  (esp_timer_get_time() - st.last_rx_us) < LINK_TIMEOUT_MS * 1000LL;
+        rx_state_t st;
+        portENTER_CRITICAL(&s_lock);
+        st = s_rx;
+        portEXIT_CRITICAL(&s_lock);
 
-    oled_clear();
+        bool linked = st.last_rx_us != 0 &&
+                      (esp_timer_get_time() - st.last_rx_us) < LINK_TIMEOUT_MS * 1000LL;
 
-    char line[24];
-    if (linked && !(st.pkt.flags & NOW_FLAG_RC2_ON)) {
-        /* 链路通、但发送端还没认出 RC2 —— 这时别画摇杆，会误导 */
-        oled_text_center(24, "LINK OK");
-        oled_text_center(36, "RC2 NOT FOUND");
-    } else if (linked) {
-        uint32_t lost = st.lost > 9999 ? 9999 : st.lost;
-        snprintf(line, sizeof(line), "%2luHZ %3dDB %+5d",
-                 (unsigned long)st.hz, st.rssi, st.pkt.dial);
-        oled_text(0, 0, line);
-        snprintf(line, sizeof(line), "L%lu", (unsigned long)lost);
-        oled_text(96, 0, line);
-        draw_stick(STICK_LX, STICK_CY, st.pkt.rz, st.pkt.z);
-        draw_stick(STICK_RX, STICK_CY, st.pkt.x, st.pkt.y);
-        draw_buttons(st.pkt.buttons);
-    } else {
-        oled_text_center(24, "NO SIGNAL");
-        snprintf(line, sizeof(line), "%2luHZ", (unsigned long)st.hz);
-        oled_text_center(36, line);
-    }
-
-    esp_err_t err = oled_flush();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "oled flush: %s", esp_err_to_name(err));
+        if (!linked) {
+            ui_message("NO LINK", "WAITING...");
+        } else {
+            ui_state_t u = {
+                .rc2_on = (st.pkt.flags & NOW_FLAG_RC2_ON) != 0,
+                .link_on = true,
+                .x = st.pkt.x, .y = st.pkt.y, .z = st.pkt.z,
+                .rz = st.pkt.rz, .dial = st.pkt.dial,
+                .buttons = st.pkt.buttons,
+                .rssi = st.rssi,
+                .lost = st.lost,
+                .pct = st.hz * 2 > 100 ? 100 : st.hz * 2,
+            };
+            ui_live(&u);
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
 
@@ -169,20 +248,16 @@ static void rate_task(void *arg)
         rx_state_t st = s_rx;
         portEXIT_CRITICAL(&s_lock);
 
+        uint32_t ok = s_tx_ok, fail = s_tx_fail;
+        s_tx_ok = s_tx_fail = 0;
+
         ESP_LOGI(TAG, "rx=%luHz rssi=%d lost=%lu seq=%lu btn=0x%06lx rc2=%d "
-                      "X=%d Y=%d Z=%d Rz=%d Dial=%d",
+                      "X=%d Y=%d Z=%d Rz=%d Dial=%d | status tx %lu/%lu peer=%d",
                  (unsigned long)st.hz, st.rssi, (unsigned long)st.lost,
                  (unsigned long)st.rx_seq, (unsigned long)st.pkt.buttons,
                  (st.pkt.flags & NOW_FLAG_RC2_ON) ? 1 : 0,
-                 st.pkt.x, st.pkt.y, st.pkt.z, st.pkt.rz, st.pkt.dial);
-    }
-}
-
-static void display_task(void *arg)
-{
-    while (true) {
-        draw_screen();          /* 400 kHz 下约 23 ms，一帧 */
-        vTaskDelay(pdMS_TO_TICKS(30));
+                 st.pkt.x, st.pkt.y, st.pkt.z, st.pkt.rz, st.pkt.dial,
+                 (unsigned long)ok, (unsigned long)(ok + fail), s_peer_ok ? 1 : 0);
     }
 }
 
@@ -199,7 +274,7 @@ static void wifi_now_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));   /* 关省电，否则收包会成串丢 */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_channel(NOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     uint8_t mac[6];
@@ -209,6 +284,8 @@ static void wifi_now_init(void)
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(now_recv_cb));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(now_send_cb));
+    add_peer(s_bcast);
 }
 
 void app_main(void)
@@ -222,26 +299,26 @@ void app_main(void)
 
     ESP_LOGI(TAG, "NOW 接收板启动（%s）", esp_app_get_description()->version);
 
-    /* 板载 RGB 灯先灭掉：WS2812 断电才会自己灭，这里主动发一帧全 0 */
-    if (ws2812_off(WS2812_GPIO) == ESP_OK) {
-        ESP_LOGI(TAG, "RGB 灯已关（GPIO%d）", WS2812_GPIO);
+    if (ws2812_init(WS2812_GPIO_DEFAULT) == ESP_OK) {
+        ws2812_set(0, 0, 0);
+        ESP_LOGI(TAG, "RGB 灯就绪（GPIO%d），左摇杆=红 右摇杆=绿 按键=蓝", WS2812_GPIO_DEFAULT);
+    } else {
+        ESP_LOGW(TAG, "RGB 灯初始化失败，只是没有灯，不影响收包");
     }
 
     wifi_now_init();
 
     err = oled_init(OLED_SDA_GPIO, OLED_SCL_GPIO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OLED 初始化失败: %s（检查 SDA=17 / SCL=18 / VCC / GND）",
-                 esp_err_to_name(err));
-        /* 屏不在也要让链路跑起来，串口照样能看到数据 */
+    if (err == ESP_OK) {
+        s_oled_ok = true;
+        ui_message("ESP-NOW RX", "WAITING...");
     } else {
-        oled_clear();
-        oled_text_center(20, "ESP-NOW RX");
-        oled_text_center(32, "WAITING...");
-        oled_flush();
+        ESP_LOGI(TAG, "OLED 不在（%s），按无头接收盒跑", esp_err_to_name(err));
     }
 
-    xTaskCreate(display_task, "disp", 4096, NULL, 4, NULL);
+    xTaskCreate(status_task, "status", 4096, NULL, 4, NULL);
+    xTaskCreate(led_task, "led", 3072, NULL, 2, NULL);
+    xTaskCreate(display_task, "disp", 4096, NULL, 3, NULL);
     xTaskCreate(rate_task, "rate", 3072, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "ready, 等发送端发包");

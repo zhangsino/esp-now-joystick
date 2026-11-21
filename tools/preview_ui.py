@@ -12,7 +12,7 @@ import re
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FONT_C = os.path.join(HERE, "..", "receiver", "main", "font6x8.c")
+FONT_C = os.path.join(HERE, "..", "common", "font6x8.c")
 
 
 def load_font():
@@ -93,13 +93,18 @@ FULL = 660
 R, LX, RX, CY = 15, 32, 96, 25
 
 
-def render(x, y, z, rz, btn, hz=50, rssi=-45, lost=0, linked=True):
+def render(x, y, z, rz, btn, dial=0, pct=100, rssi=8, lost=0, linked=True,
+           message=None):
     c = Canvas()
-    if not linked:
-        c.text_center(24, "NO SIGNAL")
-        c.text_center(36, "%2dHZ" % hz)
-    else:
-        c.text(0, 0, "%2dHZ %3dDB L%-4d" % (hz, rssi, lost))
+    if message:
+        c.text_center(20, message[0])
+        c.text_center(34, message[1])
+        return c.image()
+    c.text(0, 0, "%3d%%%+5ddB" % (pct, rssi) if linked else "NO LINK")
+    c.text(70, 0, "D%+4d" % dial)
+    if linked:
+        c.text(104, 0, "L%d" % min(lost, 999))
+    if linked:
         for cx, ax, ay in ((LX, rz, z), (RX, x, y)):
             c.circle(cx, CY, R)
             c.hline(cx - 3, CY, 7)
@@ -120,6 +125,7 @@ def render(x, y, z, rz, btn, hz=50, rssi=-45, lost=0, linked=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--x", type=int, default=330)
+    ap.add_argument("--dial", type=int, default=12)
     ap.add_argument("--y", type=int, default=-260)
     ap.add_argument("--z", type=int, default=-200)
     ap.add_argument("--rz", type=int, default=180)
@@ -127,8 +133,8 @@ def main():
     ap.add_argument("--out", default="/tmp/ui_preview.png")
     a = ap.parse_args()
 
-    a_img = render(a.x, a.y, a.z, a.rz, a.btn)
-    b_img = render(0, 0, 0, 0, 0)
+    a_img = render(a.x, a.y, a.z, a.rz, a.btn, dial=a.dial)
+    b_img = render(0, 0, 0, 0, 0, dial=0)
     c_img = render(0, 0, 0, 0, 0, linked=False)
 
     scale = 4
