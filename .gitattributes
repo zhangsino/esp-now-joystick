@@ -1,0 +1,3 @@
+# 这个目录是乐鑫官方的 USB HID 组件，为了让工程离线也能编译，整个复制进了仓库。
+# 它不是我写的，让 GitHub 的语言统计把它排除掉，否则 C 的比例全是它的。
+sender/managed_components/** linguist-vendored
