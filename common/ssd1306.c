@@ -4,6 +4,7 @@
  * 页格式显存：fb[page][col]，每字节竖着 8 个点，bit0 在最上面。
  * 命令流：每帧先发 0x00 控制字节，再发命令；0x40 控制字节后是显存数据。
  */
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
 #include "driver/i2c_master.h"
@@ -27,7 +28,7 @@ static esp_err_t cmd(uint8_t c)
 }
 
 
-esp_err_t oled_init(int sda_gpio, int scl_gpio)
+static esp_err_t try_pins(int sda_gpio, int scl_gpio)
 {
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
@@ -49,13 +50,28 @@ esp_err_t oled_init(int sda_gpio, int scl_gpio)
     };
     err = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
     if (err != ESP_OK) {
+        i2c_del_master_bus(s_bus);
+        s_bus = NULL;
         return err;
     }
 
-    /* 上电后先确认屏在总线上，不在就早点报出来，别让后面全是超时刷屏 */
     err = i2c_master_probe(s_bus, OLED_ADDR, 200);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "0x3C 无应答（SDA=%d SCL=%d）: %s", sda_gpio, scl_gpio, esp_err_to_name(err));
+        /* 顺便看看总线上到底挂了什么，方便判断是没接、还是地址不对 */
+        const uint8_t probe[] = { 0x3C, 0x3D, 0x68, 0x76 };
+        char found[48] = {0};
+        for (size_t i = 0; i < sizeof(probe); i++) {
+            if (i2c_master_probe(s_bus, probe[i], 50) == ESP_OK) {
+                size_t n = strlen(found);
+                snprintf(found + n, sizeof(found) - n, " 0x%02X", probe[i]);
+            }
+        }
+        ESP_LOGE(TAG, "0x3C 无应答（SDA=%d SCL=%d）；总线上找到:%s",
+                 sda_gpio, scl_gpio, found[0] ? found : "（什么都没有）");
+        i2c_master_bus_rm_device(s_dev);
+        i2c_del_master_bus(s_bus);
+        s_dev = NULL;
+        s_bus = NULL;
         return err;
     }
 
@@ -85,6 +101,25 @@ esp_err_t oled_init(int sda_gpio, int scl_gpio)
     }
     oled_clear();
     return oled_flush();
+}
+
+esp_err_t oled_init(int sda_gpio, int scl_gpio)
+{
+    esp_err_t err = try_pins(sda_gpio, scl_gpio);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "OLED 就绪（SDA=%d SCL=%d）", sda_gpio, scl_gpio);
+        return ESP_OK;
+    }
+    if (sda_gpio == scl_gpio) {
+        return err;
+    }
+    ESP_LOGW(TAG, "按 SDA=%d SCL=%d 没找到，交换两根线再试一次", sda_gpio, scl_gpio);
+    err = try_pins(scl_gpio, sda_gpio);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "交换后找到了 -> 实际接的是 SDA=%d SCL=%d（把线换过来更稳）",
+                 scl_gpio, sda_gpio);
+    }
+    return err;
 }
 
 void oled_clear(void)
