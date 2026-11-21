@@ -103,6 +103,23 @@ static esp_err_t try_pins(int sda_gpio, int scl_gpio)
     return oled_flush();
 }
 
+/* 找不到屏时挨个试的组合：把用户可能插错的那几对全排上。
+ * 只放"排针上相邻、能顺手插错的"组合，别把 45 个脚两两配（那要试几百次）。 */
+static const struct { uint8_t sda, scl; } s_cand[] = {
+    { 17, 18 }, { 18, 17 },   /* 既定的那一对，正反都试 */
+    { 16, 17 }, { 17, 16 },   /* 17 看成 16 */
+    { 15, 16 }, { 16, 15 },
+    { 8, 9 },   { 9, 8 },
+    { 4, 5 },   { 5, 4 },
+    { 5, 6 },   { 6, 5 },
+    { 6, 7 },   { 7, 6 },
+    { 13, 14 }, { 14, 13 },
+    { 14, 15 }, { 21, 47 },
+    { 47, 48 }, { 38, 39 },
+    { 39, 40 }, { 40, 41 },
+    { 41, 42 }, { 1, 2 }, { 2, 4 },
+};
+
 esp_err_t oled_init(int sda_gpio, int scl_gpio)
 {
     esp_err_t err = try_pins(sda_gpio, scl_gpio);
@@ -110,15 +127,20 @@ esp_err_t oled_init(int sda_gpio, int scl_gpio)
         ESP_LOGI(TAG, "OLED 就绪（SDA=%d SCL=%d）", sda_gpio, scl_gpio);
         return ESP_OK;
     }
-    if (sda_gpio == scl_gpio) {
-        return err;
+
+    /* 固定那对不通：扫一遍候选组合。找到了就报出来，用户按报的接回去即可。 */
+    for (size_t i = 0; i < sizeof(s_cand) / sizeof(s_cand[0]); i++) {
+        if (s_cand[i].sda == sda_gpio && s_cand[i].scl == scl_gpio) {
+            continue;
+        }
+        if (try_pins(s_cand[i].sda, s_cand[i].scl) == ESP_OK) {
+            ESP_LOGW(TAG, "扫描找到屏：实际接的是 SDA=%d SCL=%d（按这个接回去）",
+                     s_cand[i].sda, s_cand[i].scl);
+            return ESP_OK;
+        }
     }
-    ESP_LOGW(TAG, "按 SDA=%d SCL=%d 没找到，交换两根线再试一次", sda_gpio, scl_gpio);
-    err = try_pins(scl_gpio, sda_gpio);
-    if (err == ESP_OK) {
-        ESP_LOGW(TAG, "交换后找到了 -> 实际接的是 SDA=%d SCL=%d（把线换过来更稳）",
-                 scl_gpio, sda_gpio);
-    }
+
+    ESP_LOGE(TAG, "所有候选引脚组合都没应答 0x3C：屏没上电，或者屏坏了");
     return err;
 }
 
