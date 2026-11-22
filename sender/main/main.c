@@ -415,8 +415,8 @@ static void send_task(void *arg)
             p.z = st.z;
             p.rz = st.rz;
             p.dial = st.dial;
-            bool locked = ((st.buttons >> 7) & 1) != 0;   /* 左三态上位 = 上锁 */
-            p.flags = NOW_FLAG_RC2_ON | (locked ? 0 : NOW_FLAG_ARMED);
+            /* 锁定沿用原来的约定：左三态上位 = bit7 置位 = 车不动，flags 不用管 */
+            p.flags = NOW_FLAG_RC2_ON;
             s_tilt_active = false;
         } else if (s_tilt_ok) {
             /* ---------- 模式二：6050 倾斜 ---------- */
@@ -454,8 +454,10 @@ static void send_task(void *arg)
                 p.y = 0;
                 p.rz = 0;
             }
-            p.buttons = 0;
-            p.flags = NOW_FLAG_TILT | (armed ? NOW_FLAG_ARMED : 0);
+            /* 6050 没有按键，合成一个 bit7 当"锁"：置位 = 车不动。
+               这就是车那边唯一认的锁定信号，一行都不用改。 */
+            p.buttons = armed ? 0 : (1u << 7);
+            p.flags = NOW_FLAG_RC2_ON | NOW_FLAG_TILT;
             s_tilt_active = true;
         } else {
             /* ---------- 模式三：既没 RC2 也没 6050 ---------- */
