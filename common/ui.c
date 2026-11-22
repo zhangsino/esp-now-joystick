@@ -94,7 +94,14 @@ void ui_message(const char *l1, const char *l2)
 }
 
 /* ---------------- 倾斜遥控画面 ---------------- */
-#define TILT_FULL_DEG 30.0f   /* 打满对应的倾角 */
+static float s_dz_deg = 8.0f;      /* 盲区（度） */
+static float s_full_deg = 30.0f;   /* 打满（度） */
+
+void ui_tilt_range(float dead_deg, float full_deg)
+{
+    s_dz_deg = dead_deg;
+    s_full_deg = full_deg;
+}
 #define BOX_X0 34
 #define BOX_X1 94
 #define BOX_Y0 12
@@ -115,15 +122,15 @@ void ui_tilt(float pitch, float roll, bool armed, uint32_t pct, int16_t rssi, ui
 
     /* 外框 + 中央盲区框 */
     oled_rect(BOX_X0, BOX_Y0, BOX_X1 - BOX_X0 + 1, BOX_Y1 - BOX_Y0 + 1);
-    int dz_w = (int)((BOX_X1 - BOX_X0) * (8.0f / TILT_FULL_DEG));
-    int dz_h = (int)((BOX_Y1 - BOX_Y0) * (8.0f / TILT_FULL_DEG));
+    int dz_w = (int)((BOX_X1 - BOX_X0) * (s_dz_deg / s_full_deg));
+    int dz_h = (int)((BOX_Y1 - BOX_Y0) * (s_dz_deg / s_full_deg));
     int cx = (BOX_X0 + BOX_X1) / 2;
     int cy = (BOX_Y0 + BOX_Y1) / 2;
     oled_rect(cx - dz_w / 2, cy - dz_h / 2, dz_w, dz_h);
 
     /* 圆点：横滚管左右，俯仰管上下 */
-    float fr = roll / TILT_FULL_DEG;
-    float fp = pitch / TILT_FULL_DEG;
+    float fr = roll / s_full_deg;
+    float fp = pitch / s_full_deg;
     if (fr > 1) fr = 1; else if (fr < -1) fr = -1;
     if (fp > 1) fp = 1; else if (fp < -1) fp = -1;
     int px = cx + (int)(fr * (BOX_X1 - BOX_X0) / 2);

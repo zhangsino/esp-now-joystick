@@ -26,5 +26,6 @@ void ui_message(const char *l1, const char *l2);    /* 两行大字 */
 
 /* 倾斜遥控画面：中间一个方框，中央小方框是盲区，圆点跟着倾斜跑 */
 void ui_tilt(float pitch, float roll, bool armed, uint32_t pct, int16_t rssi, uint32_t lost);
+void ui_tilt_range(float dead_deg, float full_deg);   /* 告诉界面盲区和打满角度 */
 
 #endif

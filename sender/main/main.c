@@ -49,8 +49,8 @@ static const char *TAG = "now_tx";
 
 /* ---- 倾斜遥控（MPU6050）---- */
 #define PIN_BTN_TILT    4       /* 轻触按钮：按下=0，内部上拉 */
-#define TILT_FULL_DEG   30.0f   /* 倾 30 度打满 */
-#define TILT_DEAD_DEG   8.0f    /* 盲区：这范围内车不动 */
+#define TILT_FULL_DEG   32.0f   /* 倾 32 度打满 */
+#define TILT_DEAD_DEG   12.0f   /* 盲区：这范围内车不动（2026-11-22 用户实测 8° 太小，改 12°） */
 
 /* ------------------------------ RC2 状态 ------------------------------ */
 
@@ -674,6 +674,8 @@ void app_main(void)
         ESP_LOGW(TAG, "OLED 不在（%s）：屏没接也能跑，日志里照样有数据",
                  esp_err_to_name(err));
     }
+
+    ui_tilt_range(TILT_DEAD_DEG, TILT_FULL_DEG);
 
     if (mpu_init() == ESP_OK) {
         s_tilt_ok = true;
