@@ -438,7 +438,8 @@ static void send_task(void *arg)
             if (fabsf(roll) > TILT_DEAD_DEG) {
                 str = (fabsf(roll) - TILT_DEAD_DEG) / (TILT_FULL_DEG - TILT_DEAD_DEG);
                 if (str > 1) str = 1;
-                if (roll < 0) str = -str;
+                /* 左右方向：2026-11-22 用户实车验证后要求反过来（原来 roll<0 取负） */
+                if (roll > 0) str = -str;
             }
             /* 车那边还是按 ±660 换算，所以这里填成摇杆等价的量 */
             p.y  = (int16_t)(thr * NOW_AXIS_FULL);
