@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,6 +33,8 @@
 #include "usb/hid_host.h"
 
 #include "now_proto.h"
+#include "i2c_bus.h"
+#include "mpu6050.h"
 #include "ssd1306.h"
 #include "ui.h"
 #include "ws2812.h"
@@ -43,6 +46,11 @@ static const char *TAG = "now_tx";
 #define SEND_PERIOD_MS  20      /* 50 Hz */
 #define PEER_TIMEOUT_MS 1500    /* 这么久没收到状态包就算对面没了 */
 #define SPLASH_MS       2000    /* "RC2 CONNECTED" 停留时间 */
+
+/* ---- 倾斜遥控（MPU6050）---- */
+#define PIN_BTN_TILT    4       /* 轻触按钮：按下=0，内部上拉 */
+#define TILT_FULL_DEG   30.0f   /* 倾 30 度打满 */
+#define TILT_DEAD_DEG   8.0f    /* 盲区：这范围内车不动 */
 
 /* ------------------------------ RC2 状态 ------------------------------ */
 
@@ -57,6 +65,13 @@ static rc2_state_t s_state;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_rate_cnt;
 static volatile bool s_sim;
+
+/* 倾斜遥控状态 */
+static volatile bool  s_tilt_armed;       /* 按钮按出来的解锁状态 */
+static volatile bool  s_tilt_ok;          /* 6050 初始化成功 */
+static volatile float s_tilt_pitch, s_tilt_roll;   /* 当前角度（已扣零点） */
+static volatile bool  s_tilt_active;      /* 本次数据走的是倾斜，不是摇杆 */
+static volatile int16_t s_tilt_out_thr, s_tilt_out_str;   /* 实际发出去的 y / rz */
 
 /* ------------------------------ 链路状态 ------------------------------ */
 
@@ -379,15 +394,77 @@ static void send_task(void *arg)
         st = s_state;
         portEXIT_CRITICAL(&s_lock);
 
-        p.x = st.x;
-        p.y = st.y;
-        p.z = st.z;
-        p.rz = st.rz;
-        p.dial = st.dial;
+        /* RC2 插拔的那一下，必须把倾斜的解锁状态清掉——
+           不然拔了 RC2 车可能还带着"上次按过按钮"的解锁状态往前走 */
+        static bool prev_rc2 = false;
+        if (st.connected != prev_rc2) {
+            prev_rc2 = st.connected;
+            if (s_tilt_armed) {
+                ESP_LOGW(TAG, "RC2 %s，倾斜遥控强制回到锁定",
+                         st.connected ? "插上" : "拔掉");
+            }
+            s_tilt_armed = false;
+        }
+
         p.buttons = st.buttons;
-        p.flags = st.connected ? NOW_FLAG_RC2_ON : 0;
-        if (!st.connected && s_sim) {
-            sim_sample(&p);
+
+        if (st.connected) {
+            /* ---------- 模式一：RC2 摇杆 ---------- */
+            p.x = st.x;
+            p.y = st.y;
+            p.z = st.z;
+            p.rz = st.rz;
+            p.dial = st.dial;
+            bool locked = ((st.buttons >> 7) & 1) != 0;   /* 左三态上位 = 上锁 */
+            p.flags = NOW_FLAG_RC2_ON | (locked ? 0 : NOW_FLAG_ARMED);
+            s_tilt_active = false;
+        } else if (s_tilt_ok) {
+            /* ---------- 模式二：6050 倾斜 ---------- */
+            float ax, ay, az;
+            if (mpu_read_accel(&ax, &ay, &az) == ESP_OK) {
+                mpu_get_angles((float *)&s_tilt_pitch, (float *)&s_tilt_roll);
+            }
+            float pitch = s_tilt_pitch, roll = s_tilt_roll;
+
+            /* 前后 -> 油门；左右 -> 转向。盲区内输出 0，出盲区线性放大到 30 度打满 */
+            float thr = 0, str = 0;
+            if (fabsf(pitch) > TILT_DEAD_DEG) {
+                thr = (fabsf(pitch) - TILT_DEAD_DEG) / (TILT_FULL_DEG - TILT_DEAD_DEG);
+                if (thr > 1) thr = 1;
+                /* 实测：远端往下压 -> pitch 为负。而"前倾要前进"= y 为正，
+                   所以这里是 pitch > 0 才取负（2026-11-22 实测校准过的，别凭直觉改） */
+                if (pitch > 0) thr = -thr;
+            }
+            if (fabsf(roll) > TILT_DEAD_DEG) {
+                str = (fabsf(roll) - TILT_DEAD_DEG) / (TILT_FULL_DEG - TILT_DEAD_DEG);
+                if (str > 1) str = 1;
+                if (roll < 0) str = -str;
+            }
+            /* 车那边还是按 ±660 换算，所以这里填成摇杆等价的量 */
+            p.y  = (int16_t)(thr * NOW_AXIS_FULL);
+            p.rz = (int16_t)(str * NOW_AXIS_FULL);
+            s_tilt_out_thr = p.y;
+            s_tilt_out_str = p.rz;
+            p.x = 0;
+            p.z = 0;
+            p.dial = 0;
+
+            bool armed = s_tilt_armed;
+            if (!armed) {
+                p.y = 0;
+                p.rz = 0;
+            }
+            p.buttons = 0;
+            p.flags = NOW_FLAG_TILT | (armed ? NOW_FLAG_ARMED : 0);
+            s_tilt_active = true;
+        } else {
+            /* ---------- 模式三：既没 RC2 也没 6050 ---------- */
+            if (s_sim) {
+                sim_sample(&p);
+            } else {
+                p.flags = 0;
+            }
+            s_tilt_active = false;
         }
         p.seq = ++seq;
         p.rc2_hz = (uint8_t)(st.hz > 255 ? 255 : st.hz);
@@ -435,8 +512,11 @@ static void display_task(void *arg)
         }
         was_on = st.connected;
 
-        if (!st.connected) {
-            ui_message("PLUG IN RC2", "WAITING...");
+        if (!st.connected && s_tilt_ok) {
+            ui_tilt(s_tilt_pitch, s_tilt_roll, s_tilt_armed,
+                    s_tx_pct, s_peer_rssi, s_peer_lost);
+        } else if (!st.connected) {
+            ui_message("PLUG IN RC2", "NO MPU6050");
         } else if (esp_timer_get_time() < splash_until) {
             ui_message("RC2 CONNECTED", "USB HOST OK");
         } else {
@@ -452,6 +532,44 @@ static void display_task(void *arg)
             ui_live(&u);
         }
         vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+/* ------------------------------ 倾斜遥控的解锁按钮 ------------------------------ *
+ * 轻触按钮（非自锁），按下=0。按一下解锁、再按一下上锁，全程软件记账。
+ * 解锁的那一刻把当前姿态记成零点——手持时不可能端得绝对平，这样最省事。 */
+static void tilt_btn_task(void *arg)
+{
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << PIN_BTN_TILT,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+
+    int stable = 1;
+    int cnt = 0;
+
+    while (true) {
+        int lvl = gpio_get_level(PIN_BTN_TILT);
+        if (lvl != stable) {
+            if (++cnt >= 3) {            /* 30 ms 去抖 */
+                stable = lvl;
+                cnt = 0;
+                if (stable == 0) {       /* 按下那一下 */
+                    s_tilt_armed = !s_tilt_armed;
+                    if (s_tilt_armed) {
+                        mpu_zero_here(); /* 把当前姿态当零点 */
+                    }
+                    ESP_LOGW(TAG, "倾斜遥控 %s", s_tilt_armed ? "解锁" : "上锁");
+                }
+            }
+        } else {
+            cnt = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -506,6 +624,15 @@ static void rate_task(void *arg)
         } else {
             snprintf(txbuf, sizeof(txbuf), "广播");
         }
+        if (s_tilt_active) {
+            ESP_LOGI(TAG, "倾斜 armed=%d pitch=%+.1f roll=%+.1f -> y=%d rz=%d  "
+                          "tx=%s peer=%d rssi=%d lost=%lu",
+                     s_tilt_armed, s_tilt_pitch, s_tilt_roll,
+                     s_tilt_out_thr, s_tilt_out_str,
+                     s_peer_ok ? "单播" : "广播", s_peer_ok ? 1 : 0,
+                     s_peer_rssi, (unsigned long)s_peer_lost);
+            continue;
+        }
         ESP_LOGI(TAG, "rc2=%d hz=%lu X=%d Y=%d Z=%d Rz=%d Dial=%d btn=0x%06lx "
                       "tx=%s peer=%d rssi=%d lost=%lu%s",
                  st.connected ? 1 : 0, (unsigned long)c,
@@ -535,6 +662,8 @@ void app_main(void)
 
     wifi_now_init();
 
+    ESP_ERROR_CHECK(i2c_bus_init(I2C_BUS_SDA, I2C_BUS_SCL));
+
     err = oled_init(OLED_SDA_GPIO, OLED_SCL_GPIO);
     if (err == ESP_OK) {
         s_oled_ok = true;
@@ -544,7 +673,15 @@ void app_main(void)
                  esp_err_to_name(err));
     }
 
+    if (mpu_init() == ESP_OK) {
+        s_tilt_ok = true;
+        ESP_LOGI(TAG, "MPU6050 就绪：没插 RC2 时用倾斜控制（当前锁定，按一下按钮解锁）");
+    } else {
+        ESP_LOGW(TAG, "MPU6050 没接：倾斜遥控不可用，RC2 不受影响");
+    }
+
     xTaskCreate(usb_task, "usb_task", 4096, NULL, 4, NULL);
+    xTaskCreate(tilt_btn_task, "tbtn", 3072, NULL, 3, NULL);
     xTaskCreate(send_task, "send", 4096, NULL, 5, NULL);
     xTaskCreate(display_task, "disp", 4096, NULL, 3, NULL);
     xTaskCreate(rate_task, "rate", 3072, NULL, 2, NULL);

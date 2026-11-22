@@ -19,11 +19,13 @@
 #define NOW_MAGIC1 0x53          /* 'S' */
 #define NOW_ST0    0x52          /* 'R' 接收板回传的状态包 */
 #define NOW_ST1    0x53          /* 'S' */
-#define NOW_VER    2
+#define NOW_VER    3
 
 /* flags 位定义 */
 #define NOW_FLAG_RC2_ON    (1u << 0)   /* RC2 已枚举、正在出报告 */
 #define NOW_FLAG_CAL       (1u << 1)   /* 正在标定中位 */
+#define NOW_FLAG_ARMED     (1u << 2)   /* 允许车动（谁解锁由手持端决定，车只管执行） */
+#define NOW_FLAG_TILT      (1u << 3)   /* 本次数据来自 6050 倾斜，不是摇杆 */
 
 /* 轴满行程（实测，见 dji_rc2/README.md：逻辑 ±1024，实际只到 ±660） */
 #define NOW_AXIS_FULL 660

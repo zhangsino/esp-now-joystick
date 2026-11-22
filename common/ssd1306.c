@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "driver/i2c_master.h"
 #include "ssd1306.h"
+#include "i2c_bus.h"
 #include "font6x8.h"
 
 static const char *TAG = "oled";
@@ -30,36 +31,36 @@ static esp_err_t cmd(uint8_t c)
 }
 
 
-static esp_err_t try_pins(int sda_gpio, int scl_gpio)
+/* 屏挂在共享总线上（i2c_bus）。屏上电慢，探 5 次再判死。 */
+esp_err_t oled_init_quick(int sda_gpio, int scl_gpio)
 {
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = sda_gpio,
-        .scl_io_num = scl_gpio,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_bus);
-    if (err != ESP_OK) {
-        return err;
+    (void)sda_gpio;
+    (void)scl_gpio;
+
+    if (!i2c_bus_get()) {
+        esp_err_t e = i2c_bus_init(I2C_BUS_SDA, I2C_BUS_SCL);
+        if (e != ESP_OK) {
+            return e;
+        }
+    }
+    if (!s_bus) {
+        s_bus = i2c_bus_get();
     }
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = OLED_ADDR,
-        .scl_speed_hz = 400000,
-    };
-    err = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
-    if (err != ESP_OK) {
-        i2c_del_master_bus(s_bus);
-        s_bus = NULL;
-        return err;
+    if (!s_dev) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = OLED_ADDR,
+            .scl_speed_hz = I2C_BUS_HZ,
+        };
+        esp_err_t e = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
+        if (e != ESP_OK) {
+            return e;
+        }
     }
 
-    /* 屏上电后要几十毫秒才应答，探一次就放弃会误判"屏不在"。
-       实测：第一次 200ms 超时失败，紧接着再探就通了。 */
-    for (int attempt = 0; attempt < 5; attempt++) {
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 5; i++) {
         err = i2c_master_probe(s_bus, OLED_ADDR, 100);
         if (err == ESP_OK) {
             break;
@@ -67,41 +68,24 @@ static esp_err_t try_pins(int sda_gpio, int scl_gpio)
         vTaskDelay(pdMS_TO_TICKS(30));
     }
     if (err != ESP_OK) {
-        /* 顺便看看总线上到底挂了什么，方便判断是没接、还是地址不对 */
-        const uint8_t probe[] = { 0x3C, 0x3D, 0x68, 0x76 };
-        char found[48] = {0};
+        const uint8_t probe[] = { 0x3C, 0x3D, 0x68 };
+        char found[40] = {0};
         for (size_t i = 0; i < sizeof(probe); i++) {
             if (i2c_master_probe(s_bus, probe[i], 50) == ESP_OK) {
                 size_t n = strlen(found);
                 snprintf(found + n, sizeof(found) - n, " 0x%02X", probe[i]);
             }
         }
-        ESP_LOGE(TAG, "0x3C 无应答（SDA=%d SCL=%d）；总线上找到:%s",
-                 sda_gpio, scl_gpio, found[0] ? found : "（什么都没有）");
+        ESP_LOGE(TAG, "0x3C 无应答；总线上找到:%s", found[0] ? found : "（什么都没有）");
         i2c_master_bus_rm_device(s_dev);
-        i2c_del_master_bus(s_bus);
         s_dev = NULL;
-        s_bus = NULL;
         return err;
     }
 
     const uint8_t seq[] = {
-        0xAE,             /* display off */
-        0xD5, 0x80,       /* clock div */
-        0xA8, 0x3F,       /* multiplex 64 */
-        0xD3, 0x00,       /* display offset 0 */
-        0x40,             /* start line 0 */
-        0x8D, 0x14,       /* charge pump on */
-        0x20, 0x00,       /* horizontal addressing */
-        0xA1,             /* segment remap */
-        0xC8,             /* COM 反扫 -> 正立（实测） */
-        0xDA, 0x12,       /* COM pins */
-        0x81, 0xCF,       /* contrast */
-        0xD9, 0xF1,       /* precharge */
-        0xDB, 0x40,       /* VCOMH */
-        0xA4,             /* 显示显存 */
-        0xA6,             /* 正常（非反白） */
-        0xAF,             /* display on */
+        0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14,
+        0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1,
+        0xDB, 0x40, 0xA4, 0xA6, 0xAF,
     };
     for (size_t i = 0; i < sizeof(seq); i++) {
         err = cmd(seq[i]);
@@ -113,50 +97,12 @@ static esp_err_t try_pins(int sda_gpio, int scl_gpio)
     return oled_flush();
 }
 
-/* 找不到屏时挨个试的组合：把用户可能插错的那几对全排上。
- * 只放"排针上相邻、能顺手插错的"组合，别把 45 个脚两两配（那要试几百次）。 */
-static const struct { uint8_t sda, scl; } s_cand[] = {
-    { 17, 18 }, { 18, 17 },   /* 既定的那一对，正反都试 */
-    { 16, 17 }, { 17, 16 },   /* 17 看成 16 */
-    { 15, 16 }, { 16, 15 },
-    { 8, 9 },   { 9, 8 },
-    { 4, 5 },   { 5, 4 },
-    { 5, 6 },   { 6, 5 },
-    { 6, 7 },   { 7, 6 },
-    { 13, 14 }, { 14, 13 },
-    { 14, 15 }, { 21, 47 },
-    { 47, 48 }, { 38, 39 },
-    { 39, 40 }, { 40, 41 },
-    { 41, 42 }, { 1, 2 }, { 2, 4 },
-};
-
-/* 只试指定的一对脚，不扫候选（给"开机没找到、运行时再补一次"用） */
-esp_err_t oled_init_quick(int sda_gpio, int scl_gpio)
-{
-    return try_pins(sda_gpio, scl_gpio);
-}
-
 esp_err_t oled_init(int sda_gpio, int scl_gpio)
 {
-    esp_err_t err = try_pins(sda_gpio, scl_gpio);
+    esp_err_t err = oled_init_quick(sda_gpio, scl_gpio);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "OLED 就绪（SDA=%d SCL=%d）", sda_gpio, scl_gpio);
-        return ESP_OK;
+        ESP_LOGI(TAG, "OLED 就绪（0x3C）");
     }
-
-    /* 固定那对不通：扫一遍候选组合。找到了就报出来，用户按报的接回去即可。 */
-    for (size_t i = 0; i < sizeof(s_cand) / sizeof(s_cand[0]); i++) {
-        if (s_cand[i].sda == sda_gpio && s_cand[i].scl == scl_gpio) {
-            continue;
-        }
-        if (try_pins(s_cand[i].sda, s_cand[i].scl) == ESP_OK) {
-            ESP_LOGW(TAG, "扫描找到屏：实际接的是 SDA=%d SCL=%d（按这个接回去）",
-                     s_cand[i].sda, s_cand[i].scl);
-            return ESP_OK;
-        }
-    }
-
-    ESP_LOGE(TAG, "所有候选引脚组合都没应答 0x3C：屏没上电，或者屏坏了");
     return err;
 }
 
